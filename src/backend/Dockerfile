@@ -54,5 +54,5 @@ ENV PATH="${PATH}:/root/.dotnet/tools"
 
 EXPOSE 5000
 
-ENTRYPOINT ["dotnet", "watch", "run", "--project", "src/Api"]
+ENTRYPOINT ["dotnet", "watch", "run", "--project", "src/Api/Api/Api.csproj"]
 

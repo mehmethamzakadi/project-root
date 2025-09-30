@@ -72,7 +72,7 @@ services:
       Keycloak__Audience: "${KEYCLOAK_AUDIENCE:-my-api}"
       Serilog__WriteTo__0__Args__serverUrl: "http://seq:5341"
     ports:
-      - "5000:5000"
+      - "5001:5000"
     volumes:
       - ../../src/backend:/app
       - backend_nuget:/root/.nuget/packages
@@ -94,7 +94,7 @@ services:
     container_name: app-frontend
     environment:
       NODE_ENV: development
-      NEXT_PUBLIC_API_URL: http://localhost:5000/api
+      NEXT_PUBLIC_API_URL: http://localhost:5001/api
       NEXTAUTH_URL: http://localhost:3000
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-your-secret-key-here}
       KEYCLOAK_ID: ${KEYCLOAK_CLIENT_ID:-frontend-client}

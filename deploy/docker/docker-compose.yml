@@ -1,0 +1,157 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: app-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-appdb}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: app-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:23.0
+    container_name: app-keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${KEYCLOAK_DB:-keycloak}
+      KC_DB_USERNAME: ${DB_USER:-postgres}
+      KC_DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      KC_HOSTNAME_STRICT: false
+      KC_HTTP_ENABLED: true
+      KC_PROXY: edge
+    command: start-dev
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  backend:
+    build:
+      context: ../../src/backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: app-backend
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:5000
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=${DB_NAME:-appdb};Username=${DB_USER:-postgres};Password=${DB_PASSWORD:-postgres}"
+      Redis__Configuration: "redis:6379"
+      Keycloak__Authority: "http://keycloak:8080/realms/${KEYCLOAK_REALM:-my-realm}"
+      Keycloak__Audience: "${KEYCLOAK_AUDIENCE:-my-api}"
+      Serilog__WriteTo__0__Args__serverUrl: "http://seq:5341"
+    ports:
+      - "5000:5000"
+    volumes:
+      - ../../src/backend:/app
+      - backend_nuget:/root/.nuget/packages
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+    networks:
+      - app-network
+
+  frontend:
+    build:
+      context: ../../src/frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: app-frontend
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: http://localhost:5000/api
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-your-secret-key-here}
+      KEYCLOAK_ID: ${KEYCLOAK_CLIENT_ID:-frontend-client}
+      KEYCLOAK_SECRET: ${KEYCLOAK_CLIENT_SECRET}
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/${KEYCLOAK_REALM:-my-realm}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../../src/frontend:/app
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      - backend
+      - keycloak
+    networks:
+      - app-network
+
+  seq:
+    image: datalust/seq:latest
+    container_name: app-seq
+    environment:
+      ACCEPT_EULA: "Y"
+    ports:
+      - "5341:80"
+    volumes:
+      - seq_data:/data
+    networks:
+      - app-network
+
+  sonarqube:
+    image: sonarqube:community
+    container_name: app-sonarqube
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/${SONAR_DB:-sonar}
+      SONAR_JDBC_USERNAME: ${DB_USER:-postgres}
+      SONAR_JDBC_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "9000:9000"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_logs:/opt/sonarqube/logs
+      - sonarqube_extensions:/opt/sonarqube/extensions
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  backend_nuget:
+  frontend_node_modules:
+  seq_data:
+  sonarqube_data:
+  sonarqube_logs:
+  sonarqube_extensions:
+
+networks:
+  app-network:
+    driver: bridge

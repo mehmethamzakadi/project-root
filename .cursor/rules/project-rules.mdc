@@ -1,0 +1,3679 @@
+---
+alwaysApply: true
+---
+
+# Modern Web Uygulaması - Proje Analiz ve Geliştirme Dokümanı
+
+---
+
+## 1. Proje Genel Bakış
+
+### 1.1 Proje Tanımı
+
+Modern, güvenli, ölçeklenebilir ve bakımı kolay bir full-stack web uygulaması geliştirilecektir. Proje, endüstri standartlarına uygun mimari pattern'ler ve güncel teknolojiler kullanarak kurumsal seviyede bir çözüm sunmayı hedeflemektedir.
+
+### 1.2 Teknoloji Stack'i
+
+#### Frontend
+
+- **Framework:** Next.js v15 (App Router)
+- **Dil:** TypeScript
+- **Stil:** Tailwind CSS
+- **UI Kütüphanesi:** shadcn/ui (açık kaynak)
+- **HTTP Client:** OpenAPI TypeScript Generator ile oluşturulmuş tip-güvenli client
+
+#### Backend
+
+- **Framework:** ASP.NET Core (.NET 9) - Minimal API
+- **Dil:** C# 13
+- **Mimari:** Clean Architecture + CQRS
+- **Mediator:** DispatchR
+- **ORM:** Entity Framework Core 9 (Npgsql)
+- **Validation:** FluentValidation
+- **Logging:** Serilog
+
+#### Veritabanı ve Cache
+
+- **Veritabanı:** PostgreSQL 16
+- **Cache:** Redis 7.x (StackExchange.Redis)
+
+#### Güvenlik ve Kimlik Doğrulama
+
+- **Identity Provider:** Keycloak (OIDC + JWT)
+- **Auth Flow:** Authorization Code + PKCE
+- **Token Yönetimi:** Refresh Token Rotation
+
+#### DevOps ve Altyapı
+
+- **Container:** Docker (multi-stage build)
+- **Orchestration:** Docker Compose (dev), Kubernetes (prod - opsiyonel)
+- **CI/CD:** GitHub Actions
+- **Kod Kalitesi:** SonarQube Community Edition
+- **Hata İzleme:** Sentry (ücretsiz plan)
+
+#### Test
+
+- **Unit Test:** xUnit, NSubstitute, FluentAssertions
+- **Integration Test:** WebApplicationFactory, Testcontainers
+- **Contract Test:** Pact
+- **E2E Test:** Playwright veya Cypress
+- **Code Coverage:** Coverlet
+
+---
+
+## 2. Mimari Tasarım
+
+### 2.1 Clean Architecture Katmanları
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Presentation Layer                      │
+│  (API Controllers, Minimal API Endpoints, Middleware)        │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                     Application Layer                        │
+│  (CQRS Commands/Queries, Handlers, DTOs, Validators)        │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                       Domain Layer                           │
+│  (Entities, Value Objects, Domain Events, Interfaces)       │
+└──────────────────────────▲──────────────────────────────────┘
+                           │
+┌──────────────────────────┴──────────────────────────────────┐
+│                   Infrastructure Layer                       │
+│  (EF Core, Redis, External Services, Repositories)          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Katman Sorumlulukları
+
+#### Domain Layer (Çekirdek)
+
+- **Bağımlılık:** Hiçbir katmana bağımlı değil
+- **İçerik:**
+  - Entity'ler (Aggregate Root'lar)
+  - Value Object'ler
+  - Domain Event'ler
+  - Domain Service Interface'leri
+  - Repository Interface'leri
+  - Business kuralları ve invariant'lar
+
+#### Application Layer
+
+- **Bağımlılık:** Sadece Domain Layer'a bağımlı
+- **İçerik:**
+  - CQRS Command'ları ve Query'leri
+  - Command/Query Handler'ları (DispatchR ile)
+  - DTO'lar (Data Transfer Objects)
+  - FluentValidation Validator'ları
+  - Application Service Interface'leri
+  - Mapping Profile'ları
+
+#### Infrastructure Layer
+
+- **Bağımlılık:** Domain ve Application Layer'a bağımlı
+- **İçerik:**
+  - DbContext (EF Core)
+  - Repository implementasyonları
+  - Redis cache implementasyonları
+  - External API client'ları
+  - Email, SMS gibi servis implementasyonları
+  - Migration'lar
+
+#### Presentation Layer
+
+- **Bağımlılık:** Application ve Infrastructure Layer'a bağımlı
+- **İçerik:**
+  - Minimal API endpoint'leri
+  - Middleware'ler (Auth, Error Handling, Logging)
+  - API versiyonlama
+  - OpenAPI/Swagger konfigürasyonu
+  - Dependency Injection container setup
+
+### 2.3 CQRS Pattern
+
+```csharp
+// Command Example
+public record CreateProductCommand(
+    string Name,
+    decimal Price,
+    string CategoryId
+) : ICommand<CreateProductResult>;
+
+// Query Example
+public record GetProductByIdQuery(string Id) : IQuery<ProductDto>;
+
+// Handler Example (DispatchR)
+public class CreateProductHandler : ICommandHandler<CreateProductCommand, CreateProductResult>
+{
+    private readonly IProductRepository _repository;
+    private readonly IUnitOfWork _unitOfWork;
+
+    public async Task<CreateProductResult> Handle(
+        CreateProductCommand command,
+        CancellationToken cancellationToken)
+    {
+        // Business logic
+        var product = Product.Create(command.Name, command.Price);
+        await _repository.AddAsync(product, cancellationToken);
+        await _unitOfWork.SaveChangesAsync(cancellationToken);
+
+        return new CreateProductResult(product.Id);
+    }
+}
+```
+
+---
+
+## 3. Güvenlik Mimarisi
+
+### 3.1 Authentication Flow (Authorization Code + PKCE)
+
+```
+┌─────────┐                                  ┌──────────┐
+│ Browser │                                  │ Keycloak │
+└────┬────┘                                  └────┬─────┘
+     │                                            │
+     │ 1. Redirect to /authorize (+ code_challenge)
+     ├───────────────────────────────────────────>│
+     │                                            │
+     │ 2. User logs in                            │
+     │<──────────────────────────────────────────>│
+     │                                            │
+     │ 3. Redirect back with authorization code   │
+     │<───────────────────────────────────────────┤
+     │                                            │
+┌────▼────┐                                       │
+│Next.js  │ 4. Exchange code for tokens          │
+│Frontend │    (+ code_verifier)                 │
+└────┬────┘───────────────────────────────────────>│
+     │                                            │
+     │ 5. Access Token + Refresh Token + ID Token │
+     │<───────────────────────────────────────────┤
+     │                                            │
+┌────▼────┐                                  ┌────▼─────┐
+│Next.js  │ 6. API calls with Bearer token  │ ASP.NET  │
+│Frontend │─────────────────────────────────>│ Backend  │
+└─────────┘                                  └──────────┘
+                                                   │
+                                                   │ 7. Validate JWT
+                                                   │    (Keycloak public keys)
+                                             ┌─────▼─────┐
+                                             │ Keycloak  │
+                                             │ Discovery │
+                                             └───────────┘
+```
+
+### 3.2 JWT Token Doğrulama (Backend)
+
+**Program.cs:**
+
+```csharp
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.Authority = "https://keycloak.example.com/realms/my-realm";
+        options.Audience = "my-api";
+        options.RequireHttpsMetadata = true;
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ClockSkew = TimeSpan.FromMinutes(5)
+        };
+    });
+
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("AdminOnly", policy =>
+        policy.RequireRole("admin"));
+    options.AddPolicy("CanCreateProduct", policy =>
+        policy.RequireClaim("permission", "product:create"));
+});
+```
+
+### 3.3 Güvenlik Başlıkları
+
+**SecurityHeadersMiddleware.cs:**
+
+```csharp
+public class SecurityHeadersMiddleware
+{
+    public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        context.Response.Headers.Add("X-Content-Type-Options", "nosniff");
+        context.Response.Headers.Add("X-Frame-Options", "DENY");
+        context.Response.Headers.Add("X-XSS-Protection", "1; mode=block");
+        context.Response.Headers.Add("Referrer-Policy", "strict-origin-when-cross-origin");
+        context.Response.Headers.Add("Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains");
+
+        context.Response.Headers.Add("Content-Security-Policy",
+            "default-src 'self'; " +
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+            "style-src 'self' 'unsafe-inline'; " +
+            "img-src 'self' data: https:; " +
+            "font-src 'self' data:; " +
+            "connect-src 'self' https://api.example.com;");
+
+        await next(context);
+    }
+}
+```
+
+### 3.4 Secrets Yönetimi
+
+**Geliştirme Ortamı:**
+
+- User Secrets (dotnet user-secrets)
+- Environment Variables
+
+**Production:**
+
+- Azure Key Vault / AWS Secrets Manager / HashiCorp Vault
+- Kubernetes Secrets
+- Docker Secrets
+
+**Asla repository'e commit edilmeyecekler:**
+
+- appsettings.Production.json
+- .env files with real credentials
+- SSL certificates
+- API keys
+
+---
+
+## 4. Proje Yapısı
+
+### 4.1 Repository Yapısı
+
+```
+project-root/
+├── .github/
+│   └── workflows/
+│       ├── backend-ci.yml
+│       ├── frontend-ci.yml
+│       ├── deploy-staging.yml
+│       └── deploy-production.yml
+│
+├── src/
+│   ├── backend/
+│   │   ├── src/
+│   │   │   ├── Api/
+│   │   │   │   ├── Program.cs
+│   │   │   │   ├── appsettings.json
+│   │   │   │   ├── appsettings.Development.json
+│   │   │   │   ├── Endpoints/
+│   │   │   │   │   ├── Products/
+│   │   │   │   │   │   ├── CreateProductEndpoint.cs
+│   │   │   │   │   │   ├── GetProductEndpoint.cs
+│   │   │   │   │   │   └── UpdateProductEndpoint.cs
+│   │   │   │   │   └── Users/
+│   │   │   │   ├── Middleware/
+│   │   │   │   │   ├── ErrorHandlingMiddleware.cs
+│   │   │   │   │   ├── SecurityHeadersMiddleware.cs
+│   │   │   │   │   └── RequestLoggingMiddleware.cs
+│   │   │   │   ├── Filters/
+│   │   │   │   │   └── ValidationFilter.cs
+│   │   │   │   └── Extensions/
+│   │   │   │       ├── ServiceCollectionExtensions.cs
+│   │   │   │       └── WebApplicationExtensions.cs
+│   │   │   │
+│   │   │   ├── Application/
+│   │   │   │   ├── Common/
+│   │   │   │   │   ├── Interfaces/
+│   │   │   │   │   │   ├── IApplicationDbContext.cs
+│   │   │   │   │   │   ├── ICacheService.cs
+│   │   │   │   │   │   └── ICurrentUserService.cs
+│   │   │   │   │   ├── Models/
+│   │   │   │   │   │   ├── PaginatedList.cs
+│   │   │   │   │   │   └── Result.cs
+│   │   │   │   │   ├── Behaviours/
+│   │   │   │   │   │   ├── ValidationBehaviour.cs
+│   │   │   │   │   │   ├── LoggingBehaviour.cs
+│   │   │   │   │   │   └── CachingBehaviour.cs
+│   │   │   │   │   └── Exceptions/
+│   │   │   │   │       ├── ValidationException.cs
+│   │   │   │   │       └── NotFoundException.cs
+│   │   │   │   │
+│   │   │   │   ├── Products/
+│   │   │   │   │   ├── Commands/
+│   │   │   │   │   │   ├── CreateProduct/
+│   │   │   │   │   │   │   ├── CreateProductCommand.cs
+│   │   │   │   │   │   │   ├── CreateProductHandler.cs
+│   │   │   │   │   │   │   └── CreateProductValidator.cs
+│   │   │   │   │   │   ├── UpdateProduct/
+│   │   │   │   │   │   └── DeleteProduct/
+│   │   │   │   │   ├── Queries/
+│   │   │   │   │   │   ├── GetProducts/
+│   │   │   │   │   │   │   ├── GetProductsQuery.cs
+│   │   │   │   │   │   │   └── GetProductsHandler.cs
+│   │   │   │   │   │   └── GetProductById/
+│   │   │   │   │   └── DTOs/
+│   │   │   │   │       ├── ProductDto.cs
+│   │   │   │   │       └── ProductListDto.cs
+│   │   │   │   │
+│   │   │   │   └── DependencyInjection.cs
+│   │   │   │
+│   │   │   ├── Domain/
+│   │   │   │   ├── Common/
+│   │   │   │   │   ├── BaseEntity.cs
+│   │   │   │   │   ├── BaseAuditableEntity.cs
+│   │   │   │   │   ├── ValueObject.cs
+│   │   │   │   │   └── DomainEvent.cs
+│   │   │   │   ├── Entities/
+│   │   │   │   │   ├── Product.cs
+│   │   │   │   │   ├── Category.cs
+│   │   │   │   │   └── User.cs
+│   │   │   │   ├── ValueObjects/
+│   │   │   │   │   ├── Money.cs
+│   │   │   │   │   └── Email.cs
+│   │   │   │   ├── Events/
+│   │   │   │   │   └── ProductCreatedEvent.cs
+│   │   │   │   ├── Enums/
+│   │   │   │   │   └── ProductStatus.cs
+│   │   │   │   ├── Exceptions/
+│   │   │   │   │   └── DomainException.cs
+│   │   │   │   └── Interfaces/
+│   │   │   │       ├── IProductRepository.cs
+│   │   │   │       └── IUnitOfWork.cs
+│   │   │   │
+│   │   │   └── Infrastructure/
+│   │   │       ├── Data/
+│   │   │       │   ├── ApplicationDbContext.cs
+│   │   │       │   ├── Configurations/
+│   │   │       │   │   ├── ProductConfiguration.cs
+│   │   │       │   │   └── CategoryConfiguration.cs
+│   │   │       │   ├── Migrations/
+│   │   │       │   ├── Interceptors/
+│   │   │       │   │   └── AuditableEntityInterceptor.cs
+│   │   │       │   └── Repositories/
+│   │   │       │       ├── ProductRepository.cs
+│   │   │       │       └── UnitOfWork.cs
+│   │   │       │
+│   │   │       ├── Cache/
+│   │   │       │   └── RedisCacheService.cs
+│   │   │       │
+│   │   │       ├── Services/
+│   │   │       │   └── CurrentUserService.cs
+│   │   │       │
+│   │   │       └── DependencyInjection.cs
+│   │   │
+│   │   ├── tests/
+│   │   │   ├── Api.Tests/
+│   │   │   │   └── Endpoints/
+│   │   │   ├── Application.Tests/
+│   │   │   │   ├── Products/
+│   │   │   │   │   ├── Commands/
+│   │   │   │   │   └── Queries/
+│   │   │   │   └── Common/
+│   │   │   ├── Domain.Tests/
+│   │   │   │   └── Entities/
+│   │   │   ├── Infrastructure.Tests/
+│   │   │   │   └── Repositories/
+│   │   │   └── Integration.Tests/
+│   │   │       ├── CustomWebApplicationFactory.cs
+│   │   │       ├── TestContainersSetup.cs
+│   │   │       └── Products/
+│   │   │
+│   │   ├── Backend.sln
+│   │   ├── Dockerfile
+│   │   ├── .dockerignore
+│   │   └── Directory.Build.props
+│   │
+│   └── frontend/
+│       ├── src/
+│       │   ├── app/
+│       │   │   ├── layout.tsx
+│       │   │   ├── page.tsx
+│       │   │   ├── (auth)/
+│       │   │   │   ├── login/
+│       │   │   │   └── callback/
+│       │   │   ├── (dashboard)/
+│       │   │   │   ├── layout.tsx
+│       │   │   │   ├── products/
+│       │   │   │   │   ├── page.tsx
+│       │   │   │   │   ├── [id]/
+│       │   │   │   │   │   └── page.tsx
+│       │   │   │   │   └── create/
+│       │   │   │   │       └── page.tsx
+│       │   │   │   └── settings/
+│       │   │   └── api/
+│       │   │       └── auth/
+│       │   │           └── [...nextauth]/
+│       │   │
+│       │   ├── components/
+│       │   │   ├── ui/              # shadcn/ui components
+│       │   │   │   ├── button.tsx
+│       │   │   │   ├── card.tsx
+│       │   │   │   ├── input.tsx
+│       │   │   │   └── ...
+│       │   │   ├── layout/
+│       │   │   │   ├── Header.tsx
+│       │   │   │   ├── Sidebar.tsx
+│       │   │   │   └── Footer.tsx
+│       │   │   ├── products/
+│       │   │   │   ├── ProductList.tsx
+│       │   │   │   ├── ProductCard.tsx
+│       │   │   │   └── ProductForm.tsx
+│       │   │   └── common/
+│       │   │       ├── ErrorBoundary.tsx
+│       │   │       └── LoadingSpinner.tsx
+│       │   │
+│       │   ├── lib/
+│       │   │   ├── api/
+│       │   │   │   ├── client.ts        # Generated API client
+│       │   │   │   └── axios-config.ts
+│       │   │   ├── auth/
+│       │   │   │   ├── auth-config.ts
+│       │   │   │   └── auth-provider.tsx
+│       │   │   ├── utils/
+│       │   │   │   ├── cn.ts
+│       │   │   │   └── format.ts
+│       │   │   └── hooks/
+│       │   │       ├── useAuth.ts
+│       │   │       └── useProducts.ts
+│       │   │
+│       │   ├── types/
+│       │   │   └── index.ts
+│       │   │
+│       │   └── styles/
+│       │       └── globals.css
+│       │
+│       ├── public/
+│       ├── tests/
+│       │   ├── unit/
+│       │   ├── integration/
+│       │   └── e2e/
+│       │       └── products.spec.ts
+│       │
+│       ├── next.config.js
+│       ├── tailwind.config.ts
+│       ├── tsconfig.json
+│       ├── package.json
+│       ├── Dockerfile
+│       ├── .dockerignore
+│       └── components.json        # shadcn/ui config
+│
+├── deploy/
+│   ├── docker/
+│   │   ├── docker-compose.yml
+│   │   ├── docker-compose.dev.yml
+│   │   ├── docker-compose.prod.yml
+│   │   └── .env.example
+│   │
+│   ├── kubernetes/
+│   │   ├── base/
+│   │   │   ├── kustomization.yaml
+│   │   │   ├── deployment.yaml
+│   │   │   ├── service.yaml
+│   │   │   └── ingress.yaml
+│   │   ├── overlays/
+│   │   │   ├── staging/
+│   │   │   └── production/
+│   │   └── secrets/
+│   │       └── .gitkeep
+│   │
+│   └── scripts/
+│       ├── init-db.sh
+│       ├── backup.sh
+│       └── restore.sh
+│
+├── docs/
+│   ├── architecture/
+│   │   ├── overview.md
+│   │   ├── api-design.md
+│   │   └── database-schema.md
+│   ├── development/
+│   │   ├── getting-started.md
+│   │   ├── coding-standards.md
+│   │   └── testing-guide.md
+│   └── deployment/
+│       ├── docker-guide.md
+│       └── kubernetes-guide.md
+│
+├── .gitignore
+├── .editorconfig
+├── README.md
+└── LICENSE
+```
+
+---
+
+## 5. Geliştirme Ortamı Setup
+
+### 5.1 Docker Compose Konfigürasyonu
+
+**deploy/docker/docker-compose.yml:**
+
+```yaml
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: app-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-appdb}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: app-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:23.0
+    container_name: app-keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${KEYCLOAK_DB:-keycloak}
+      KC_DB_USERNAME: ${DB_USER:-postgres}
+      KC_DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      KC_HOSTNAME_STRICT: false
+      KC_HTTP_ENABLED: true
+      KC_PROXY: edge
+    command: start-dev
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  backend:
+    build:
+      context: ../../src/backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: app-backend
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:5000
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=${DB_NAME:-appdb};Username=${DB_USER:-postgres};Password=${DB_PASSWORD:-postgres}"
+      Redis__Configuration: "redis:6379"
+      Keycloak__Authority: "http://keycloak:8080/realms/${KEYCLOAK_REALM:-my-realm}"
+      Keycloak__Audience: "${KEYCLOAK_AUDIENCE:-my-api}"
+      Serilog__WriteTo__0__Args__serverUrl: "http://seq:5341"
+    ports:
+      - "5000:5000"
+    volumes:
+      - ../../src/backend:/app
+      - backend_nuget:/root/.nuget/packages
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+    networks:
+      - app-network
+
+  frontend:
+    build:
+      context: ../../src/frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: app-frontend
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: http://localhost:5000/api
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-your-secret-key-here}
+      KEYCLOAK_ID: ${KEYCLOAK_CLIENT_ID:-frontend-client}
+      KEYCLOAK_SECRET: ${KEYCLOAK_CLIENT_SECRET}
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/${KEYCLOAK_REALM:-my-realm}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../../src/frontend:/app
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      - backend
+      - keycloak
+    networks:
+      - app-network
+
+  seq:
+    image: datalust/seq:latest
+    container_name: app-seq
+    environment:
+      ACCEPT_EULA: "Y"
+    ports:
+      - "5341:80"
+    volumes:
+      - seq_data:/data
+    networks:
+      - app-network
+
+  sonarqube:
+    image: sonarqube:community
+    container_name: app-sonarqube
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/${SONAR_DB:-sonar}
+      SONAR_JDBC_USERNAME: ${DB_USER:-postgres}
+      SONAR_JDBC_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "9000:9000"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_logs:/opt/sonarqube/logs
+      - sonarqube_extensions:/opt/sonarqube/extensions
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  backend_nuget:
+  frontend_node_modules:
+  seq_data:
+  sonarqube_data:
+  sonarqube_logs:
+  sonarqube_extensions:
+
+networks:
+  app-network:
+    driver: bridge
+```
+
+### 5.2 Backend Dockerfile (Multi-Stage)
+
+**src/backend/Dockerfile:**
+
+```dockerfile
+# Build Stage
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
+
+# Copy solution and project files
+COPY *.sln .
+COPY src/Api/*.csproj ./src/Api/
+COPY src/Application/*.csproj ./src/Application/
+COPY src/Domain/*.csproj ./src/Domain/
+COPY src/Infrastructure/*.csproj ./src/Infrastructure/
+
+# Restore dependencies
+RUN dotnet restore
+
+# Copy everything else
+COPY . .
+
+# Build
+WORKDIR /src/src/Api
+RUN dotnet build -c Release -o /app/build
+
+# Publish Stage
+FROM build AS publish
+RUN dotnet publish -c Release -o /app/publish /p:UseAppHost=false
+
+# Runtime Stage
+FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
+WORKDIR /app
+
+# Create non-root user
+RUN addgroup --system --gid 1000 appuser \
+    && adduser --system --uid 1000 --ingroup appuser --shell /bin/sh appuser
+
+# Copy published files
+COPY --from=publish /app/publish .
+
+# Change ownership
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+EXPOSE 5000
+
+ENTRYPOINT ["dotnet", "Api.dll"]
+
+# Development Stage
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS development
+WORKDIR /app
+
+# Install tools
+RUN dotnet tool install --global dotnet-ef
+ENV PATH="${PATH}:/root/.dotnet/tools"
+
+EXPOSE 5000
+
+ENTRYPOINT ["dotnet", "watch", "run", "--project", "src/Api"]
+```
+
+### 5.3 Frontend Dockerfile (Multi-Stage)
+
+**src/frontend/Dockerfile:**
+
+```dockerfile
+# Dependencies Stage
+FROM node:20-alpine AS deps
+WORKDIR /app
+
+# Copy package files
+COPY package.json package-lock.json* ./
+
+# Install dependencies
+RUN npm ci
+
+# Builder Stage
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# Set environment variables
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_ENV=production
+
+# Build application
+RUN npm run build
+
+# Production Stage
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Create non-root user
+RUN addgroup --system --gid 1001 nodejs \
+    && adduser --system --uid 1001 nextjs
+
+# Copy necessary files
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
+
+CMD ["node", "server.js"]
+
+# Development Stage
+FROM node:20-alpine AS development
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+COPY . .
+
+EXPOSE 3000
+
+CMD ["npm", "run", "dev"]
+```
+
+---
+
+## 6. CI/CD Pipeline
+
+### 6.1 Backend CI Pipeline
+
+**.github/workflows/backend-ci.yml:**
+
+```yaml
+name: Backend CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "src/backend/**"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "src/backend/**"
+
+env:
+  DOTNET_VERSION: "9.0.x"
+  SOLUTION_PATH: "src/backend/Backend.sln"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # For SonarQube
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.SOLUTION_PATH }}
+
+      - name: Build
+        run: dotnet build ${{ env.SOLUTION_PATH }} --configuration Release --no-restore
+
+      - name: Run unit tests
+        run: |
+          dotnet test ${{ env.SOLUTION_PATH }} \
+            --configuration Release \
+            --no-build \
+            --logger trx \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./coverage
+
+      - name: Code Coverage Report
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          directory: ./coverage
+          fail_ci_if_error: true
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=my-project-backend
+            -Dsonar.cs.opencover.reportsPaths=coverage/**/coverage.opencover.xml
+
+      - name: Build Docker image
+        run: |
+          docker build -t backend:${{ github.sha }} \
+            -f src/backend/Dockerfile \
+            src/backend
+
+      - name: Run security scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: backend:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Run integration tests
+        run: |
+          dotnet test src/backend/tests/Integration.Tests/*.csproj \
+            --configuration Release \
+            --logger trx \
+            --results-directory ./integration-results
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: ./integration-results
+```
+
+### 6.2 Frontend CI Pipeline
+
+**.github/workflows/frontend-ci.yml:**
+
+```yaml
+name: Frontend CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "src/frontend/**"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "src/frontend/**"
+
+env:
+  NODE_VERSION: "20.x"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: src/frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: src/frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: src/frontend
+        run: npm run lint
+
+      - name: Type check
+        working-directory: src/frontend
+        run: npm run type-check
+
+      - name: Run unit tests
+        working-directory: src/frontend
+        run: npm run test:unit -- --coverage
+
+      - name: Build
+        working-directory: src/frontend
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=my-project-frontend
+            -Dsonar.sources=src/frontend/src
+            -Dsonar.javascript.lcov.reportPaths=src/frontend/coverage/lcov.info
+
+      - name: Build Docker image
+        run: |
+          docker build -t frontend:${{ github.sha }} \
+            -f src/frontend/Dockerfile \
+            src/frontend
+
+  e2e-tests:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        working-directory: src/frontend
+        run: npm ci
+
+      - name: Install Playwright
+        working-directory: src/frontend
+        run: npx playwright install --with-deps
+
+      - name: Start services
+        run: docker-compose -f deploy/docker/docker-compose.yml up -d
+
+      - name: Wait for services
+        run: |
+          timeout 120 bash -c 'until curl -f http://localhost:3000; do sleep 2; done'
+          timeout 120 bash -c 'until curl -f http://localhost:5000/health; do sleep 2; done'
+
+      - name: Run E2E tests
+        working-directory: src/frontend
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: src/frontend/playwright-report
+
+      - name: Stop services
+        if: always()
+        run: docker-compose -f deploy/docker/docker-compose.yml down
+```
+
+### 6.3 Deployment Pipeline
+
+**.github/workflows/deploy-production.yml:**
+
+```yaml
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME_BACKEND: ${{ github.repository }}/backend
+  IMAGE_NAME_FRONTEND: ${{ github.repository }}/frontend
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (Backend)
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_BACKEND }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: src/backend
+          file: src/backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          target: runtime
+
+      - name: Extract metadata (Frontend)
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_FRONTEND }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: src/frontend
+          file: src/frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          target: runner
+
+  deploy-kubernetes:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -k deploy/kubernetes/overlays/production
+          kubectl rollout status deployment/backend -n production
+          kubectl rollout status deployment/frontend -n production
+
+      - name: Notify Sentry of deployment
+        uses: getsentry/action-release@v1
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        with:
+          environment: production
+          version: ${{ github.ref_name }}
+```
+
+---
+
+## 7. OpenAPI ve TypeScript Client Generation
+
+### 7.1 Backend OpenAPI Konfigürasyonu
+
+**Program.cs:**
+
+```csharp
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "My API",
+        Version = "v1",
+        Description = "Modern Web Application API",
+        Contact = new OpenApiContact
+        {
+            Name = "Support",
+            Email = "support@example.com"
+        }
+    });
+
+    // JWT Authentication
+    options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Description = "JWT Authorization header using the Bearer scheme",
+        Name = "Authorization",
+        In = ParameterLocation.Header,
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT"
+    });
+
+    options.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        {
+            new OpenApiSecurityScheme
+            {
+                Reference = new OpenApiReference
+                {
+                    Type = ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                }
+            },
+            Array.Empty<string>()
+        }
+    });
+
+    // XML Comments
+    var xmlFile = $"{Assembly.GetExecutingAssembly().GetName().Name}.xml";
+    var xmlPath = Path.Combine(AppContext.BaseDirectory, xmlFile);
+    if (File.Exists(xmlPath))
+    {
+        options.IncludeXmlComments(xmlPath);
+    }
+});
+
+// Enable Swagger in all environments for development
+app.UseSwagger();
+app.UseSwaggerUI(options =>
+{
+    options.SwaggerEndpoint("/swagger/v1/swagger.json", "My API V1");
+    options.RoutePrefix = "swagger";
+});
+```
+
+### 7.2 TypeScript Client Generation
+
+**package.json (backend):**
+
+```json
+{
+  "scripts": {
+    "generate-openapi": "dotnet run --project src/Api -- --generate-openapi",
+    "export-openapi": "curl http://localhost:5000/swagger/v1/swagger.json -o openapi.json"
+  }
+}
+```
+
+**package.json (frontend):**
+
+```json
+{
+  "scripts": {
+    "generate-client": "openapi-typescript-codegen --input ../../src/backend/openapi.json --output ./src/lib/api/generated --client axios",
+    "postinstall": "npm run generate-client"
+  },
+  "devDependencies": {
+    "openapi-typescript-codegen": "^0.27.0"
+  }
+}
+```
+
+**src/frontend/src/lib/api/client.ts:**
+
+```typescript
+import axios, { AxiosInstance, AxiosError } from "axios";
+import { getSession } from "next-auth/react";
+
+class ApiClient {
+  private client: AxiosInstance;
+
+  constructor(baseURL: string) {
+    this.client = axios.create({
+      baseURL,
+      headers: {
+        "Content-Type": "application/json",
+      },
+    });
+
+    // Request interceptor - Add JWT token
+    this.client.interceptors.request.use(
+      async (config) => {
+        const session = await getSession();
+        if (session?.accessToken) {
+          config.headers.Authorization = `Bearer ${session.accessToken}`;
+        }
+        return config;
+      },
+      (error) => Promise.reject(error)
+    );
+
+    // Response interceptor - Handle errors
+    this.client.interceptors.response.use(
+      (response) => response,
+      async (error: AxiosError) => {
+        if (error.response?.status === 401) {
+          // Redirect to login or refresh token
+          window.location.href = "/login";
+        }
+        return Promise.reject(error);
+      }
+    );
+  }
+
+  public getClient(): AxiosInstance {
+    return this.client;
+  }
+}
+
+export const apiClient = new ApiClient(
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api"
+);
+
+// Export generated services with configured client
+export * from "./generated";
+```
+
+---
+
+## 8. Test Stratejisi
+
+### 8.1 Test Piramidi
+
+```
+           ╱╲
+          ╱E2E╲           ~5-10% (Playwright/Cypress)
+         ╱──────╲
+        ╱Contract╲        ~10-15% (Pact)
+       ╱──────────╲
+      ╱Integration╲       ~20-25% (WebApplicationFactory)
+     ╱──────────────╲
+    ╱     Unit       ╲    ~60-65% (xUnit, Jest)
+   ╱────────────────────╲
+```
+
+### 8.2 Unit Test Örneği (Backend)
+
+**CreateProductHandlerTests.cs:**
+
+```csharp
+public class CreateProductHandlerTests
+{
+    private readonly IProductRepository _repository;
+    private readonly IUnitOfWork _unitOfWork;
+    private readonly CreateProductHandler _handler;
+
+    public CreateProductHandlerTests()
+    {
+        _repository = Substitute.For<IProductRepository>();
+        _unitOfWork = Substitute.For<IUnitOfWork>();
+        _handler = new CreateProductHandler(_repository, _unitOfWork);
+    }
+
+    [Fact]
+    public async Task Handle_ValidCommand_ReturnsSuccessResult()
+    {
+        // Arrange
+        var command = new CreateProductCommand("Test Product", 99.99m, "category-1");
+        var cancellationToken = CancellationToken.None;
+
+        _unitOfWork.SaveChangesAsync(cancellationToken)
+            .Returns(Task.CompletedTask);
+
+        // Act
+        var result = await _handler.Handle(command, cancellationToken);
+
+        // Assert
+        result.Should().NotBeNull();
+        result.Id.Should().NotBeEmpty();
+
+        await _repository.Received(1)
+            .AddAsync(Arg.Any<Product>(), cancellationToken);
+        await _unitOfWork.Received(1)
+            .SaveChangesAsync(cancellationToken);
+    }
+
+    [Fact]
+    public async Task Handle_InvalidPrice_ThrowsDomainException()
+    {
+        // Arrange
+        var command = new CreateProductCommand("Test", -10m, "category-1");
+
+        // Act & Assert
+        await FluentActions.Invoking(() =>
+            _handler.Handle(command, CancellationToken.None))
+            .Should().ThrowAsync<DomainException>()
+            .WithMessage("*price*");
+    }
+}
+```
+
+### 8.3 Integration Test Örneği
+
+**ProductEndpointsTests.cs:**
+
+```csharp
+public class ProductEndpointsTests : IClassFixture<CustomWebApplicationFactory>
+{
+    private readonly HttpClient _client;
+    private readonly CustomWebApplicationFactory _factory;
+
+    public ProductEndpointsTests(CustomWebApplicationFactory factory)
+    {
+        _factory = factory;
+        _client = factory.CreateClient();
+    }
+
+    [Fact]
+    public async Task CreateProduct_ValidRequest_ReturnsCreated()
+    {
+        // Arrange
+        var request = new CreateProductRequest
+        {
+            Name = "Integration Test Product",
+            Price = 49.99m,
+            CategoryId = "test-category"
+        };
+
+        // Act
+        var response = await _client.PostAsJsonAsync("/api/products", request);
+
+        // Assert
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+
+        var content = await response.Content.ReadFromJsonAsync<ProductResponse>();
+        content.Should().NotBeNull();
+        content!.Name.Should().Be(request.Name);
+
+        response.Headers.Location.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task GetProducts_WithPagination_ReturnsPagedResults()
+    {
+        // Arrange
+        await SeedTestData();
+
+        // Act
+        var response = await _client.GetAsync("/api/products?page=1&pageSize=10");
+
+        // Assert
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var content = await response.Content
+            .ReadFromJsonAsync<PaginatedList<ProductDto>>();
+
+        content.Should().NotBeNull();
+        content!.Items.Should().HaveCountLessOrEqualTo(10);
+        content.TotalCount.Should().BeGreaterThan(0);
+    }
+}
+```
+
+### 8.4 E2E Test Örneği (Frontend)
+
+**tests/e2e/products.spec.ts:**
+
+```typescript
+import { test, expect } from "@playwright/test";
+
+test.describe("Product Management", () => {
+  test.beforeEach(async ({ page }) => {
+    // Login
+    await page.goto("/login");
+    await page.fill('input[name="email"]', "test@example.com");
+    await page.fill('input[name="password"]', "password");
+    await page.click('button[type="submit"]');
+    await page.waitForURL("/dashboard");
+  });
+
+  test("should create a new product", async ({ page }) => {
+    // Navigate to product creation
+    await page.goto("/dashboard/products/create");
+
+    // Fill form
+    await page.fill('input[name="name"]', "E2E Test Product");
+    await page.fill('input[name="price"]', "99.99");
+    await page.selectOption('select[name="category"]', "electronics");
+
+    // Submit
+    await page.click('button[type="submit"]');
+
+    // Assert success
+    await expect(page.locator(".toast-success")).toBeVisible();
+    await expect(page).toHaveURL(/\/dashboard\/products\/[\w-]+/);
+
+    // Verify product details
+    await expect(page.locator("h1")).toContainText("E2E Test Product");
+    await expect(page.locator(".price")).toContainText("$99.99");
+  });
+
+  test("should display validation errors", async ({ page }) => {
+    await page.goto("/dashboard/products/create");
+
+    // Submit empty form
+    await page.click('button[type="submit"]');
+
+    // Assert validation errors
+    await expect(page.locator(".error-message")).toHaveCount(3);
+    await expect(page.locator(".error-message")).toContainText([
+      "Name is required",
+      "Price is required",
+      "Category is required",
+    ]);
+  });
+
+  test("should filter products by category", async ({ page }) => {
+    await page.goto("/dashboard/products");
+
+    // Select category filter
+    await page.selectOption('select[name="category"]', "electronics");
+
+    // Wait for results
+    await page.waitForResponse((response) =>
+      response.url().includes("/api/products")
+    );
+
+    // Assert filtered results
+    const products = page.locator(".product-card");
+    await expect(products).toHaveCountGreaterThan(0);
+
+    for (const product of await products.all()) {
+      await expect(product.locator(".category-badge")).toContainText(
+        "Electronics"
+      );
+    }
+  });
+});
+```
+
+---
+
+## 9. Kod Kalitesi ve İzleme
+
+### 9.1 SonarQube Konfigürasyonu
+
+**sonar-project.properties:**
+
+```properties
+sonar.projectKey=my-project
+sonar.projectName=My Project
+sonar.projectVersion=1.0
+
+# Backend
+sonar.sources=src/backend/src
+sonar.tests=src/backend/tests
+sonar.cs.opencover.reportsPaths=**/coverage.opencover.xml
+sonar.cs.vstest.reportsPaths=**/*.trx
+
+# Frontend
+sonar.sources=src/frontend/src
+sonar.tests=src/frontend/tests
+sonar.javascript.lcov.reportPaths=src/frontend/coverage/lcov.info
+sonar.typescript.tsconfigPath=src/frontend/tsconfig.json
+
+# Exclusions
+sonar.exclusions=**/*.spec.ts,**/*.test.ts,**/node_modules/**,**/obj/**,**/bin/**
+
+# Quality Gates
+sonar.qualitygate.wait=true
+```
+
+### 9.2 Sentry Konfigürasyonu
+
+**Backend - Program.cs:**
+
+```csharp
+builder.WebHost.UseSentry(options =>
+{
+    options.Dsn = builder.Configuration["Sentry:Dsn"];
+    options.Environment = builder.Environment.EnvironmentName;
+    options.TracesSampleRate = 1.0;
+    options.SendDefaultPii = false;
+    options.AttachStacktrace = true;
+    options.MaxBreadcrumbs = 50;
+    options.Debug = builder.Environment.IsDevelopment();
+
+    // Release tracking
+    options.Release = Assembly.GetExecutingAssembly()
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+        .InformationalVersion;
+});
+```
+
+**Frontend - sentry.client.config.ts:**
+
+```typescript
+import * as Sentry from "@sentry/nextjs";
+
+Sentry.init({
+  dsn: process.env.NEXT_PUBLIC_SENTRY_DSN,
+  environment: process.env.NODE_ENV,
+  tracesSampleRate: 1.0,
+  replaysSessionSampleRate: 0.1,
+  replaysOnErrorSampleRate: 1.0,
+
+  integrations: [
+    Sentry.replayIntegration({
+      maskAllText: true,
+      blockAllMedia: true,
+    }),
+  ],
+
+  beforeSend(event, hint) {
+    // Filter out sensitive data
+    if (event.request) {
+      delete event.request.cookies;
+      delete event.request.headers;
+    }
+    return event;
+  },
+});
+```
+
+### 9.3 Linting ve Formatting
+
+**.editorconfig:**
+
+```ini
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{cs,csx}]
+indent_style = space
+indent_size = 4
+
+[*.{ts,tsx,js,jsx,json}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+```
+
+**eslint.config.js (Frontend):**
+
+```javascript
+module.exports = {
+  extends: [
+    "next/core-web-vitals",
+    "plugin:@typescript-eslint/recommended",
+    "prettier",
+  ],
+  plugins: ["@typescript-eslint"],
+  rules: {
+    "@typescript-eslint/no-unused-vars": "error",
+    "@typescript-eslint/no-explicit-any": "warn",
+    "no-console": ["warn", { allow: ["warn", "error"] }],
+  },
+};
+```
+
+**.editorconfig (Backend):**
+
+```ini
+# CS8618: Non-nullable field must contain a non-null value
+dotnet_diagnostic.CS8618.severity = error
+
+# CA1031: Do not catch general exception types
+dotnet_diagnostic.CA1031.severity = warning
+
+# Naming conventions
+dotnet_naming_rule.interfaces_should_be_prefixed_with_i.severity = error
+dotnet_naming_rule.interfaces_should_be_prefixed_with_i.symbols = interface
+dotnet_naming_rule.interfaces_should_be_prefixed_with_i.style = begins_with_i
+```
+
+---
+
+## 10. Best Practices
+
+### 10.1 Backend Best Practices
+
+#### Domain Layer
+
+```csharp
+// ✅ DO: Use Value Objects for domain concepts
+public class Money : ValueObject
+{
+    public decimal Amount { get; }
+    public string Currency { get; }
+
+    private Money(decimal amount, string currency)
+    {
+        Amount = amount;
+        Currency = currency;
+    }
+
+    public static Money Create(decimal amount, string currency)
+    {
+        if (amount < 0)
+            throw new DomainException("Amount cannot be negative");
+
+        if (string.IsNullOrWhiteSpace(currency))
+            throw new DomainException("Currency is required");
+
+        return new Money(amount, currency);
+    }
+
+    protected override IEnumerable<object> GetEqualityComponents()
+    {
+        yield return Amount;
+        yield return Currency;
+    }
+}
+
+// ✅ DO: Encapsulate business logic in entities
+public class Product : BaseAuditableEntity
+{
+    public string Name { get; private set; } = string.Empty;
+    public Money Price { get; private set; } = null!;
+    public ProductStatus Status { get; private set; }
+
+    // Factory method
+    public static Product Create(string name, Money price)
+    {
+        var product = new Product
+        {
+            Id = Guid.NewGuid().ToString(),
+            Name = name,
+            Price = price,
+            Status = ProductStatus.Draft
+        };
+
+        product.AddDomainEvent(new ProductCreatedEvent(product.Id));
+        return product;
+    }
+
+    // Business operation
+    public void Publish()
+    {
+        if (Status != ProductStatus.Draft)
+            throw new DomainException("Only draft products can be published");
+
+        Status = ProductStatus.Published;
+        AddDomainEvent(new ProductPublishedEvent(Id));
+    }
+}
+
+// ❌ DON'T: Expose setters or allow invalid state
+public class BadProduct
+{
+    public string Name { get; set; } // ❌ Public setter
+    public decimal Price { get; set; } // ❌ No validation
+}
+```
+
+#### Application Layer
+
+```csharp
+// ✅ DO: Use DispatchR for CQRS
+public record CreateProductCommand(
+    string Name,
+    decimal Price,
+    string Currency,
+    string CategoryId
+) : ICommand<Result<ProductDto>>;
+
+// ✅ DO: Validate with FluentValidation
+public class CreateProductCommandValidator : AbstractValidator<CreateProductCommand>
+{
+    public CreateProductCommandValidator()
+    {
+        RuleFor(x => x.Name)
+            .NotEmpty()
+            .MaximumLength(200);
+
+        RuleFor(x => x.Price)
+            .GreaterThan(0)
+            .LessThan(1_000_000);
+
+        RuleFor(x => x.Currency)
+            .NotEmpty()
+            .Length(3)
+            .Must(BeValidCurrency);
+
+        RuleFor(x => x.CategoryId)
+            .NotEmpty();
+    }
+
+    private bool BeValidCurrency(string currency)
+    {
+        return new[] { "USD", "EUR", "TRY" }.Contains(currency);
+    }
+}
+
+// ✅ DO: Keep handlers focused and testable
+public class CreateProductHandler
+    : ICommandHandler<CreateProductCommand, Result<ProductDto>>
+{
+    private readonly IProductRepository _repository;
+    private readonly IUnitOfWork _unitOfWork;
+    private readonly ICategoryRepository _categoryRepository;
+
+    public CreateProductHandler(
+        IProductRepository repository,
+        IUnitOfWork unitOfWork,
+        ICategoryRepository categoryRepository)
+    {
+        _repository = repository;
+        _unitOfWork = unitOfWork;
+        _categoryRepository = categoryRepository;
+    }
+
+    public async Task<Result<ProductDto>> Handle(
+        CreateProductCommand command,
+        CancellationToken cancellationToken)
+    {
+        // Validate category exists
+        var category = await _categoryRepository
+            .GetByIdAsync(command.CategoryId, cancellationToken);
+
+        if (category == null)
+            return Result<ProductDto>.Failure("Category not found");
+
+        // Create domain object
+        var money = Money.Create(command.Price, command.Currency);
+        var product = Product.Create(command.Name, money);
+        product.AssignCategory(category);
+
+        // Persist
+        await _repository.AddAsync(product, cancellationToken);
+        await _unitOfWork.SaveChangesAsync(cancellationToken);
+
+        // Return DTO
+        return Result<ProductDto>.Success(MapToDto(product));
+    }
+}
+```
+
+#### Infrastructure Layer
+
+```csharp
+// ✅ DO: Use EF Core configurations
+public class ProductConfiguration : IEntityTypeConfiguration<Product>
+{
+    public void Configure(EntityTypeBuilder<Product> builder)
+    {
+        builder.ToTable("Products");
+
+        builder.HasKey(p => p.Id);
+
+        builder.Property(p => p.Name)
+            .IsRequired()
+            .HasMaxLength(200);
+
+        // Value Object mapping
+        builder.OwnsOne(p => p.Price, money =>
+        {
+            money.Property(m => m.Amount)
+                .HasColumnName("Price")
+                .HasPrecision(18, 2);
+
+            money.Property(m => m.Currency)
+                .HasColumnName("Currency")
+                .HasMaxLength(3);
+        });
+
+        builder.Property(p => p.Status)
+            .HasConversion<string>();
+
+        // Indexes
+        builder.HasIndex(p => p.Name);
+        builder.HasIndex(p => p.CreatedAt);
+    }
+}
+
+// ✅ DO: Implement repository pattern properly
+public class ProductRepository : IProductRepository
+{
+    private readonly ApplicationDbContext _context;
+
+    public ProductRepository(ApplicationDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<Product?> GetByIdAsync(
+        string id,
+        CancellationToken cancellationToken = default)
+    {
+        return await _context.Products
+            .Include(p => p.Category)
+            .FirstOrDefaultAsync(p => p.Id == id, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<Product>> GetAllAsync(
+        CancellationToken cancellationToken = default)
+    {
+        return await _context.Products
+            .AsNoTracking()
+            .OrderByDescending(p => p.CreatedAt)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task AddAsync(
+        Product product,
+        CancellationToken cancellationToken = default)
+    {
+        await _context.Products.AddAsync(product, cancellationToken);
+    }
+
+    public void Update(Product product)
+    {
+        _context.Products.Update(product);
+    }
+
+    public void Delete(Product product)
+    {
+        _context.Products.Remove(product);
+    }
+}
+```
+
+#### Presentation Layer (Minimal API)
+
+```csharp
+// ✅ DO: Group endpoints logically
+public static class ProductEndpoints
+{
+    public static IEndpointRouteBuilder MapProductEndpoints(
+        this IEndpointRouteBuilder app)
+    {
+        var group = app.MapGroup("/api/products")
+            .WithTags("Products")
+            .RequireAuthorization();
+
+        group.MapGet("/", GetProducts)
+            .WithName("GetProducts")
+            .Produces<PaginatedList<ProductDto>>()
+            .ProducesProblem(StatusCodes.Status400BadRequest);
+
+        group.MapGet("/{id}", GetProductById)
+            .WithName("GetProductById")
+            .Produces<ProductDto>()
+            .ProducesProblem(StatusCodes.Status404NotFound);
+
+        group.MapPost("/", CreateProduct)
+            .WithName("CreateProduct")
+            .Produces<ProductDto>(StatusCodes.Status201Created)
+            .ProducesValidationProblem();
+
+        group.MapPut("/{id}", UpdateProduct)
+            .WithName("UpdateProduct")
+            .Produces<ProductDto>()
+            .ProducesValidationProblem()
+            .ProducesProblem(StatusCodes.Status404NotFound);
+
+        group.MapDelete("/{id}", DeleteProduct)
+            .WithName("DeleteProduct")
+            .Produces(StatusCodes.Status204NoContent)
+            .ProducesProblem(StatusCodes.Status404NotFound);
+
+        return app;
+    }
+
+    private static async Task<IResult> GetProducts(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 10,
+        [AsParameters] GetProductsQuery query,
+        IDispatcher dispatcher,
+        CancellationToken cancellationToken = default)
+    {
+        var result = await dispatcher.Dispatch(query, cancellationToken);
+        return Results.Ok(result);
+    }
+
+    private static async Task<IResult> CreateProduct(
+        [FromBody] CreateProductRequest request,
+        IDispatcher dispatcher,
+        LinkGenerator linkGenerator,
+        HttpContext httpContext,
+        CancellationToken cancellationToken = default)
+    {
+        var command = new CreateProductCommand(
+            request.Name,
+            request.Price,
+            request.Currency,
+            request.CategoryId
+        );
+
+        var result = await dispatcher.Dispatch(command, cancellationToken);
+
+        if (!result.IsSuccess)
+            return Results.BadRequest(result.Error);
+
+        var url = linkGenerator.GetUriByName(
+            httpContext,
+            "GetProductById",
+            new { id = result.Value!.Id }
+        );
+
+        return Results.Created(url, result.Value);
+    }
+}
+```
+
+### 10.2 Frontend Best Practices
+
+#### Component Structure
+
+```typescript
+// ✅ DO: Use Server Components by default (Next.js 15)
+// app/(dashboard)/products/page.tsx
+import { Suspense } from "react";
+import { ProductList } from "@/components/products/ProductList";
+import { ProductListSkeleton } from "@/components/products/ProductListSkeleton";
+
+export default async function ProductsPage({
+  searchParams,
+}: {
+  searchParams: { page?: string; search?: string };
+}) {
+  return (
+    <div className="container mx-auto py-8">
+      <h1 className="text-3xl font-bold mb-6">Products</h1>
+
+      <Suspense fallback={<ProductListSkeleton />}>
+        <ProductList
+          page={Number(searchParams.page) || 1}
+          search={searchParams.search}
+        />
+      </Suspense>
+    </div>
+  );
+}
+
+// ✅ DO: Use Client Components only when needed
+// components/products/ProductForm.tsx
+("use client");
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { apiClient } from "@/lib/api/client";
+import { toast } from "sonner";
+
+const productSchema = z.object({
+  name: z.string().min(1, "Name is required").max(200),
+  price: z.number().positive("Price must be positive"),
+  currency: z.enum(["USD", "EUR", "TRY"]),
+  categoryId: z.string().min(1, "Category is required"),
+});
+
+type ProductFormData = z.infer<typeof productSchema>;
+
+export function ProductForm() {
+  const router = useRouter();
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<ProductFormData>({
+    resolver: zodResolver(productSchema),
+  });
+
+  const onSubmit = async (data: ProductFormData) => {
+    setIsSubmitting(true);
+
+    try {
+      const response = await apiClient.products.create(data);
+      toast.success("Product created successfully");
+      router.push(`/dashboard/products/${response.data.id}`);
+    } catch (error) {
+      toast.error("Failed to create product");
+      console.error(error);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+      <div>
+        <Input
+          {...register("name")}
+          placeholder="Product name"
+          disabled={isSubmitting}
+        />
+        {errors.name && (
+          <p className="text-sm text-red-600 mt-1">{errors.name.message}</p>
+        )}
+      </div>
+
+      <div>
+        <Input
+          {...register("price", { valueAsNumber: true })}
+          type="number"
+          step="0.01"
+          placeholder="Price"
+          disabled={isSubmitting}
+        />
+        {errors.price && (
+          <p className="text-sm text-red-600 mt-1">{errors.price.message}</p>
+        )}
+      </div>
+
+      <Button type="submit" disabled={isSubmitting}>
+        {isSubmitting ? "Creating..." : "Create Product"}
+      </Button>
+    </form>
+  );
+}
+```
+
+#### Custom Hooks
+
+```typescript
+// ✅ DO: Create reusable custom hooks
+// lib/hooks/useProducts.ts
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { apiClient } from "@/lib/api/client";
+import type { ProductDto, CreateProductRequest } from "@/lib/api/generated";
+
+export function useProducts(page = 1, pageSize = 10) {
+  return useQuery({
+    queryKey: ["products", page, pageSize],
+    queryFn: () => apiClient.products.getAll({ page, pageSize }),
+    staleTime: 5 * 60 * 1000, // 5 minutes
+  });
+}
+
+export function useProduct(id: string) {
+  return useQuery({
+    queryKey: ["products", id],
+    queryFn: () => apiClient.products.getById(id),
+    enabled: !!id,
+  });
+}
+
+export function useCreateProduct() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (data: CreateProductRequest) => apiClient.products.create(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["products"] });
+    },
+  });
+}
+
+export function useUpdateProduct() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, data }: { id: string; data: UpdateProductRequest }) =>
+      apiClient.products.update(id, data),
+    onSuccess: (_, { id }) => {
+      queryClient.invalidateQueries({ queryKey: ["products"] });
+      queryClient.invalidateQueries({ queryKey: ["products", id] });
+    },
+  });
+}
+
+export function useDeleteProduct() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => apiClient.products.delete(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["products"] });
+    },
+  });
+}
+```
+
+#### Error Handling
+
+```typescript
+// ✅ DO: Implement proper error boundaries
+// components/common/ErrorBoundary.tsx
+"use client";
+
+import { Component, ReactNode } from "react";
+import * as Sentry from "@sentry/nextjs";
+import { Button } from "@/components/ui/button";
+
+interface Props {
+  children: ReactNode;
+  fallback?: ReactNode;
+}
+
+interface State {
+  hasError: boolean;
+  error?: Error;
+}
+
+export class ErrorBoundary extends Component<Props, State> {
+  constructor(props: Props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError(error: Error): State {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    Sentry.captureException(error, { contexts: { react: errorInfo } });
+  }
+
+  render() {
+    if (this.state.hasError) {
+      if (this.props.fallback) {
+        return this.props.fallback;
+      }
+
+      return (
+        <div className="flex flex-col items-center justify-center min-h-screen p-4">
+          <h1 className="text-2xl font-bold mb-4">Something went wrong</h1>
+          <p className="text-gray-600 mb-6">
+            We apologize for the inconvenience. Please try again.
+          </p>
+          <Button onClick={() => this.setState({ hasError: false })}>
+            Try again
+          </Button>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+// app/error.tsx (Next.js 15)
+("use client");
+
+import { useEffect } from "react";
+import * as Sentry from "@sentry/nextjs";
+import { Button } from "@/components/ui/button";
+
+export default function Error({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  useEffect(() => {
+    Sentry.captureException(error);
+  }, [error]);
+
+  return (
+    <div className="flex flex-col items-center justify-center min-h-screen p-4">
+      <h2 className="text-2xl font-bold mb-4">Something went wrong!</h2>
+      <Button onClick={reset}>Try again</Button>
+    </div>
+  );
+}
+```
+
+### 10.3 Security Best Practices
+
+#### Input Validation
+
+```csharp
+// ✅ DO: Validate all inputs
+public class CreateUserCommandValidator : AbstractValidator<CreateUserCommand>
+{
+    public CreateUserCommandValidator()
+    {
+        RuleFor(x => x.Email)
+            .NotEmpty()
+            .EmailAddress()
+            .MaximumLength(255);
+
+        RuleFor(x => x.Password)
+            .NotEmpty()
+            .MinimumLength(8)
+            .Matches(@"[A-Z]").WithMessage("Password must contain uppercase")
+            .Matches(@"[a-z]").WithMessage("Password must contain lowercase")
+            .Matches(@"[0-9]").WithMessage("Password must contain number")
+            .Matches(@"[\W]").WithMessage("Password must contain special char");
+
+        RuleFor(x => x.Username)
+            .NotEmpty()
+            .MinimumLength(3)
+            .MaximumLength(50)
+            .Matches(@"^[a-zA-Z0-9_-]+$")
+            .WithMessage("Username can only contain letters, numbers, _ and -");
+    }
+}
+```
+
+#### SQL Injection Prevention
+
+```csharp
+// ✅ DO: Use parameterized queries (EF Core does this by default)
+var products = await _context.Products
+    .Where(p => p.Name.Contains(searchTerm)) // Safe
+    .ToListAsync();
+
+// ❌ DON'T: Use string concatenation
+var query = $"SELECT * FROM Products WHERE Name LIKE '%{searchTerm}%'"; // Vulnerable!
+```
+
+#### XSS Prevention
+
+```typescript
+// ✅ DO: React escapes by default
+<div>{userInput}</div> // Safe
+
+// ❌ DON'T: Use dangerouslySetInnerHTML without sanitization
+<div dangerouslySetInnerHTML={{ __html: userInput }} /> // Vulnerable!
+
+// ✅ DO: Sanitize if you must use HTML
+import DOMPurify from 'dompurify';
+
+<div dangerouslySetInnerHTML={{
+  __html: DOMPurify.sanitize(userInput)
+}} /> // Safe
+```
+
+#### CSRF Protection
+
+```csharp
+// ✅ DO: Enable anti-forgery tokens for forms
+builder.Services.AddAntiforgery(options =>
+{
+    options.HeaderName = "X-CSRF-TOKEN";
+    options.Cookie.Name = "X-CSRF-TOKEN";
+    options.Cookie.SameSite = SameSiteMode.Strict;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+});
+
+app.UseAntiforgery();
+```
+
+---
+
+## 11. Performance Optimization
+
+### 11.1 Backend Caching Strategy
+
+```csharp
+// ✅ DO: Implement caching with Redis
+public class RedisCacheService : ICacheService
+{
+    private readonly IConnectionMultiplexer _redis;
+    private readonly IDatabase _database;
+    private readonly ILogger<RedisCacheService> _logger;
+
+    public RedisCacheService(
+        IConnectionMultiplexer redis,
+        ILogger<RedisCacheService> logger)
+    {
+        _redis = redis;
+        _database = redis.GetDatabase();
+        _logger = logger;
+    }
+
+    public async Task<T?> GetAsync<T>(
+        string key,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var value = await _database.StringGetAsync(key);
+
+            if (value.IsNullOrEmpty)
+                return default;
+
+            return JsonSerializer.Deserialize<T>(value!);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting cache key {Key}", key);
+            return default;
+        }
+    }
+
+    public async Task SetAsync<T>(
+        string key,
+        T value,
+        TimeSpan? expiry = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var serialized = JsonSerializer.Serialize(value);
+            await _database.StringSetAsync(
+                key,
+                serialized,
+                expiry ?? TimeSpan.FromMinutes(10)
+            );
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error setting cache key {Key}", key);
+        }
+    }
+
+    public async Task RemoveAsync(
+        string key,
+        CancellationToken cancellationToken = default)
+    {
+        await _database.KeyDeleteAsync(key);
+    }
+
+    public async Task RemoveByPatternAsync(
+        string pattern,
+        CancellationToken cancellationToken = default)
+    {
+        var endpoints = _redis.GetEndPoints();
+        var server = _redis.GetServer(endpoints.First());
+
+        var keys = server.Keys(pattern: pattern).ToArray();
+
+        if (keys.Any())
+            await _database.KeyDeleteAsync(keys);
+    }
+}
+
+// ✅ DO: Use caching behavior with DispatchR
+public class CachingBehavior<TRequest, TResponse>
+    : IPipelineBehavior<TRequest, TResponse>
+    where TRequest : ICacheableQuery
+{
+    private readonly ICacheService _cache;
+    private readonly ILogger<CachingBehavior<TRequest, TResponse>> _logger;
+
+    public async Task<TResponse> Handle(
+        TRequest request,
+        RequestHandlerDelegate<TResponse> next,
+        CancellationToken cancellationToken)
+    {
+        if (request.BypassCache)
+            return await next();
+
+        var cacheKey = request.CacheKey;
+        var cachedResponse = await _cache.GetAsync<TResponse>(
+            cacheKey,
+            cancellationToken
+        );
+
+        if (cachedResponse != null)
+        {
+            _logger.LogInformation("Cache hit for {CacheKey}", cacheKey);
+            return cachedResponse;
+        }
+
+        var response = await next();
+
+        await _cache.SetAsync(
+            cacheKey,
+            response,
+            request.CacheExpiry,
+            cancellationToken
+        );
+
+        return response;
+    }
+}
+```
+
+### 11.2 Database Optimization
+
+```csharp
+// ✅ DO: Use indexes appropriately
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    // Single column index
+    modelBuilder.Entity<Product>()
+        .HasIndex(p => p.Name);
+
+    // Composite index
+    modelBuilder.Entity<Product>()
+        .HasIndex(p => new { p.CategoryId, p.Status });
+
+    // Filtered index
+    modelBuilder.Entity<Product>()
+        .HasIndex(p => p.CreatedAt)
+        .HasFilter("[Status] = 'Published'");
+}
+
+// ✅ DO: Use AsNoTracking for read-only queries
+public async Task<IReadOnlyList<ProductDto>> GetProductsAsync()
+{
+    return await _context.Products
+        .AsNoTracking() // Performance boost for read-only
+        .Select(p => new ProductDto
+        {
+            Id = p.Id,
+            Name = p.Name,
+            Price = p.Price.Amount
+        })
+        .ToListAsync();
+}
+
+// ✅ DO: Use projection to select only needed columns
+// Good - selects only needed fields
+var products = await _context.Products
+    .Select(p => new { p.Id, p.Name, p.Price })
+    .ToListAsync();
+
+// Bad - loads entire entity
+var products = await _context.Products.ToListAsync();
+
+// ✅ DO: Use compiled queries for frequently executed queries
+private static readonly Func<ApplicationDbContext, string, Task<Product?>>
+    GetProductByIdCompiled = EF.CompileAsyncQuery(
+        (ApplicationDbContext context, string id) =>
+            context.Products
+                .Include(p => p.Category)
+                .FirstOrDefault(p => p.Id == id)
+    );
+```
+
+### 11.3 Frontend Optimization
+
+```typescript
+// ✅ DO: Use React.memo for expensive components
+export const ProductCard = React.memo(function ProductCard({
+  product,
+  onDelete,
+}: ProductCardProps) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{product.name}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <p className="text-2xl font-bold">${product.price}</p>
+      </CardContent>
+      <CardFooter>
+        <Button onClick={() => onDelete(product.id)}>Delete</Button>
+      </CardFooter>
+    </Card>
+  );
+});
+
+// ✅ DO: Use dynamic imports for code splitting
+const ProductForm = dynamic(() => import("@/components/products/ProductForm"), {
+  loading: () => <Skeleton className="h-96" />,
+  ssr: false,
+});
+
+// ✅ DO: Implement virtualization for large lists
+import { useVirtualizer } from "@tanstack/react-virtual";
+
+export function ProductList({ products }: { products: ProductDto[] }) {
+  const parentRef = useRef<HTMLDivElement>(null);
+
+  const virtualizer = useVirtualizer({
+    count: products.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 100,
+    overscan: 5,
+  });
+
+  return (
+    <div ref={parentRef} className="h-screen overflow-auto">
+      <div
+        style={{
+          height: `${virtualizer.getTotalSize()}px`,
+          position: "relative",
+        }}
+      >
+        {virtualizer.getVirtualItems().map((virtualItem) => (
+          <div
+            key={virtualItem.key}
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              width: "100%",
+              height: `${virtualItem.size}px`,
+              transform: `translateY(${virtualItem.start}px)`,
+            }}
+          >
+            <ProductCard product={products[virtualItem.index]} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ✅ DO: Optimize images
+import Image from "next/image";
+
+<Image
+  src="/product.jpg"
+  alt="Product"
+  width={400}
+  height={300}
+  priority={false}
+  loading="lazy"
+  placeholder="blur"
+/>;
+```
+
+---
+
+## 12. Monitoring ve Logging
+
+### 12.1 Structured Logging (Serilog)
+
+**appsettings.json:**
+
+```json
+{
+  "Serilog": {
+    "Using": [
+      "Serilog.Sinks.Console",
+      "Serilog.Sinks.Seq",
+      "Serilog.Sinks.File"
+    ],
+    "MinimumLevel": {
+      "Default": "Information",
+      "Override": {
+        "Microsoft": "Warning",
+        "Microsoft.EntityFrameworkCore": "Warning",
+        "System": "Warning"
+      }
+    },
+    "WriteTo": [
+      {
+        "Name": "Console",
+        "Args": {
+          "outputTemplate": "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj} {Properties:j}{NewLine}{Exception}"
+        }
+      },
+      {
+        "Name": "Seq",
+        "Args": {
+          "serverUrl": "http://seq:5341",
+          "apiKey": ""
+        }
+      },
+      {
+        "Name": "File",
+        "Args": {
+          "path": "/logs/app-.log",
+          "rollingInterval": "Day",
+          "retainedFileCountLimit": 7,
+          "outputTemplate": "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}{Exception}"
+        }
+      }
+    ],
+    "Enrich": ["FromLogContext", "WithMachineName", "WithThreadId"],
+    "Properties": {
+      "Application": "MyApp"
+    }
+  }
+}
+```
+
+**Program.cs:**
+
+```csharp
+// Configure Serilog
+builder.Host.UseSerilog((context, services, configuration) =>
+{
+    configuration
+        .ReadFrom.Configuration(context.Configuration)
+        .ReadFrom.Services(services)
+        .Enrich.FromLogContext()
+        .Enrich.WithProperty("Environment", context.HostingEnvironment.EnvironmentName)
+        .Enrich.WithProperty("Application", "MyApp")
+        .WriteTo.Console()
+        .WriteTo.Seq(context.Configuration["Serilog:WriteTo:1:Args:serverUrl"]!);
+});
+
+// Request logging middleware
+app.UseSerilogRequestLogging(options =>
+{
+    options.MessageTemplate =
+        "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.0000} ms";
+
+    options.EnrichDiagnosticContext = (diagnosticContext, httpContext) =>
+    {
+        diagnosticContext.Set("RequestHost", httpContext.Request.Host.Value);
+        diagnosticContext.Set("RequestScheme", httpContext.Request.Scheme);
+        diagnosticContext.Set("UserAgent", httpContext.Request.Headers["User-Agent"].ToString());
+
+        if (httpContext.User.Identity?.IsAuthenticated == true)
+        {
+            diagnosticContext.Set("UserId", httpContext.User.FindFirst("sub")?.Value);
+            diagnosticContext.Set("UserName", httpContext.User.Identity.Name);
+        }
+    };
+});
+```
+
+### 12.2 Health Checks
+
+```csharp
+builder.Services.AddHealthChecks()
+    .AddNpgSql(
+        builder.Configuration.GetConnectionString("DefaultConnection")!,
+        name: "postgres",
+        timeout: TimeSpan.FromSeconds(3))
+    .AddRedis(
+        builder.Configuration["Redis:Configuration"]!,
+        name: "redis",
+        timeout: TimeSpan.FromSeconds(3))
+    .AddUrlGroup(
+        new Uri(builder.Configuration["Keycloak:Authority"]!),
+        name: "keycloak",
+        timeout: TimeSpan.FromSeconds(3));
+
+app.MapHealthChecks("/health", new HealthCheckOptions
+{
+    ResponseWriter = async (context, report) =>
+    {
+        context.Response.ContentType = "application/json";
+
+        var result = JsonSerializer.Serialize(new
+        {
+            status = report.Status.ToString(),
+            checks = report.Entries.Select(e => new
+            {
+                name = e.Key,
+                status = e.Value.Status.ToString(),
+                description = e.Value.Description,
+                duration = e.Value.Duration.TotalMilliseconds
+            }),
+            totalDuration = report.TotalDuration.TotalMilliseconds
+        });
+
+        await context.Response.WriteAsync(result);
+    }
+});
+
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready")
+});
+
+app.MapHealthChecks("/health/live", new HealthCheckOptions
+{
+    Predicate = _ => false
+});
+```
+
+---
+
+## 13. Deployment Stratejileri
+
+### 13.1 Docker Compose Production
+
+**deploy/docker/docker-compose.prod.yml:**
+
+```yaml
+version: "3.9"
+
+services:
+  backend:
+    image: ghcr.io/myorg/myapp-backend:latest
+    restart: always
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: http://+:5000
+      ConnectionStrings__DefaultConnection: ${DB_CONNECTION_STRING}
+      Redis__Configuration: ${REDIS_CONNECTION_STRING}
+      Keycloak__Authority: ${KEYCLOAK_AUTHORITY}
+      Sentry__Dsn: ${SENTRY_DSN}
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    image: ghcr.io/myorg/myapp-frontend:latest
+    restart: always
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${API_URL}
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    networks:
+      - app-network
+    depends_on:
+      - backend
+
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    networks:
+      - app-network
+    depends_on:
+      - frontend
+      - backend
+
+networks:
+  app-network:
+    driver: overlay
+```
+
+### 13.2 Kubernetes Deployment
+
+**deploy/kubernetes/base/backend-deployment.yaml:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels:
+    app: backend
+    tier: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: backend
+        tier: api
+    spec:
+      containers:
+        - name: backend
+          image: ghcr.io/myorg/myapp-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5000
+              name: http
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+            - name: ASPNETCORE_URLS
+              value: "http://+:5000"
+            - name: ConnectionStrings__DefaultConnection
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: db-connection-string
+            - name: Redis__Configuration
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: redis-connection-string
+            - name: Keycloak__Authority
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: keycloak-authority
+            - name: Sentry__Dsn
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: sentry-dsn
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  selector:
+    app: backend
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 5000
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+```
+
+**deploy/kubernetes/base/ingress.yaml:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://myapp.com"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.myapp.com
+        - myapp.com
+      secretName: app-tls-cert
+  rules:
+    - host: api.myapp.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-service
+                port:
+                  number: 80
+    - host: myapp.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
+```
+
+---
+
+## 14. Database Migrations ve Seeding
+
+### 14.1 Migration Strategy
+
+```csharp
+// Program.cs - Auto-migration on startup (Development only)
+if (app.Environment.IsDevelopment())
+{
+    using var scope = app.Services.CreateScope();
+    var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+    await context.Database.MigrateAsync();
+    await ApplicationDbContextSeed.SeedAsync(context);
+}
+
+// ApplicationDbContextSeed.cs
+public static class ApplicationDbContextSeed
+{
+    public static async Task SeedAsync(ApplicationDbContext context)
+    {
+        // Seed Categories
+        if (!await context.Categories.AnyAsync())
+        {
+            var categories = new[]
+            {
+                new Category { Id = Guid.NewGuid().ToString(), Name = "Electronics" },
+                new Category { Id = Guid.NewGuid().ToString(), Name = "Books" },
+                new Category { Id = Guid.NewGuid().ToString(), Name = "Clothing" },
+            };
+
+            await context.Categories.AddRangeAsync(categories);
+            await context.SaveChangesAsync();
+        }
+
+        // Seed Products
+        if (!await context.Products.AnyAsync())
+        {
+            var electronics = await context.Categories
+                .FirstAsync(c => c.Name == "Electronics");
+
+            var products = new[]
+            {
+                Product.Create("Laptop", Money.Create(999.99m, "USD")),
+                Product.Create("Smartphone", Money.Create(699.99m, "USD")),
+                Product.Create("Headphones", Money.Create(199.99m, "USD")),
+            };
+
+            foreach (var product in products)
+            {
+                product.AssignCategory(electronics);
+            }
+
+            await context.Products.AddRangeAsync(products);
+            await context.SaveChangesAsync();
+        }
+    }
+}
+```
+
+### 14.2 Migration Scripts
+
+**deploy/scripts/migrate.sh:**
+
+```bash
+#!/bin/bash
+set -e
+
+echo "Running database migrations..."
+
+cd /app
+
+# Wait for database to be ready
+until dotnet ef database update --no-build; do
+  echo "Waiting for database to be ready..."
+  sleep 5
+done
+
+echo "Migrations completed successfully"
+```
+
+**Kubernetes Job for Migrations:**
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+spec:
+  template:
+    spec:
+      containers:
+        - name: migration
+          image: ghcr.io/myorg/myapp-backend:latest
+          command: ["dotnet", "ef", "database", "update"]
+          env:
+            - name: ConnectionStrings__DefaultConnection
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: db-connection-string
+      restartPolicy: OnFailure
+  backoffLimit: 3
+```
+
+---
+
+## 15. Backup ve Disaster Recovery
+
+### 15.1 PostgreSQL Backup
+
+**deploy/scripts/backup.sh:**
+
+```bash
+#!/bin/bash
+
+BACKUP_DIR="/backups"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+BACKUP_FILE="${BACKUP_DIR}/backup_${TIMESTAMP}.sql.gz"
+RETENTION_DAYS=7
+
+# Create backup directory
+mkdir -p ${BACKUP_DIR}
+
+# Backup database
+echo "Creating backup: ${BACKUP_FILE}"
+pg_dump -h ${DB_HOST} -U ${DB_USER} -d ${DB_NAME} | gzip > ${BACKUP_FILE}
+
+# Verify backup
+if [ -f ${BACKUP_FILE} ]; then
+    echo "Backup created successfully: ${BACKUP_FILE}"
+
+    # Upload to cloud storage (example: AWS S3)
+    if [ ! -z "${AWS_S3_BUCKET}" ]; then
+        aws s3 cp ${BACKUP_FILE} s3://${AWS_S3_BUCKET}/backups/
+        echo "Backup uploaded to S3"
+    fi
+else
+    echo "Backup failed!"
+    exit 1
+fi
+
+# Remove old backups
+echo "Removing backups older than ${RETENTION_DAYS} days..."
+find ${BACKUP_DIR} -name "backup_*.sql.gz" -mtime +${RETENTION_DAYS} -delete
+
+echo "Backup process completed"
+```
+
+**Kubernetes CronJob for Backups:**
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+spec:
+  schedule: "0 2 * * *" # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: postgres:16-alpine
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  pg_dump -h postgres-service -U $POSTGRES_USER -d $POSTGRES_DB | \
+                  gzip > /backups/backup_$(date +%Y%m%d_%H%M%S).sql.gz
+              env:
+                - name: POSTGRES_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-secret
+                      key: username
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-secret
+                      key: password
+                - name: POSTGRES_DB
+                  value: appdb
+              volumeMounts:
+                - name: backup-volume
+                  mountPath: /backups
+          volumes:
+            - name: backup-volume
+              persistentVolumeClaim:
+                claimName: backup-pvc
+          restartPolicy: OnFailure
+```
+
+### 15.2 Restore Procedure
+
+**deploy/scripts/restore.sh:**
+
+```bash
+#!/bin/bash
+
+if [ -z "$1" ]; then
+    echo "Usage: ./restore.sh <backup_file>"
+    exit 1
+fi
+
+BACKUP_FILE=$1
+
+if [ ! -f ${BACKUP_FILE} ]; then
+    echo "Backup file not found: ${BACKUP_FILE}"
+    exit 1
+fi
+
+echo "WARNING: This will overwrite the existing database!"
+read -p "Are you sure you want to continue? (yes/no): " CONFIRM
+
+if [ "$CONFIRM" != "yes" ]; then
+    echo "Restore cancelled"
+    exit 0
+fi
+
+# Drop existing connections
+psql -h ${DB_HOST} -U ${DB_USER} -d postgres -c \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${DB_NAME}';"
+
+# Drop and recreate database
+psql -h ${DB_HOST} -U ${DB_USER} -d postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};"
+psql -h ${DB_HOST} -U ${DB_USER} -d postgres -c "CREATE DATABASE ${DB_NAME};"
+
+# Restore backup
+echo "Restoring database from: ${BACKUP_FILE}"
+gunzip -c ${BACKUP_FILE} | psql -h ${DB_HOST} -U ${DB_USER} -d ${DB_NAME}
+
+echo "Database restored successfully"
+```
+
+---
+
+## 16. İzleme ve Alerting
+
+### 16.1 Prometheus Metrics
+
+**Backend Metrics:**
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(metrics =>
+    {
+        metrics
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation()
+            .AddRuntimeInstrumentation()
+            .AddPrometheusExporter();
+    });
+
+app.MapPrometheusScrapingEndpoint();
+
+// Custom metrics
+public class MetricsService
+{
+    private readonly Counter<long> _productCreatedCounter;
+    private readonly Histogram<double> _queryDurationHistogram;
+
+    public MetricsService(IMeterFactory meterFactory)
+    {
+        var meter = meterFactory.Create("MyApp.Metrics");
+
+        _productCreatedCounter = meter.CreateCounter<long>(
+            "products_created_total",
+            description: "Total number of products created"
+        );
+
+        _queryDurationHistogram = meter.CreateHistogram<double>(
+            "query_duration_seconds",
+            description: "Query execution duration"
+        );
+    }
+
+    public void RecordProductCreated() => _productCreatedCounter.Add(1);
+
+    public void RecordQueryDuration(double duration) =>
+        _queryDurationHistogram.Record(duration);
+}
+```
+
+### 16.2 Grafana Dashboard
+
+**prometheus.yml:**
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "backend"
+    static_configs:
+      - targets: ["backend:5000"]
+    metrics_path: "/metrics"
+
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+```
+
+---
+
+## 17. Development Workflow
+
+### 17.1 Local Development Setup
+
+```bash
+# Clone repository
+git clone https://github.com/myorg/myapp.git
+cd myapp
+
+# Start infrastructure services
+cd deploy/docker
+docker-compose up -d postgres redis keycloak
+
+# Backend setup
+cd ../../src/backend
+dotnet restore
+dotnet ef database update
+dotnet run --project src/Api
+
+# Frontend setup (in another terminal)
+cd ../../src/frontend
+npm install
+npm run dev
+```
+
+### 17.2 Git Workflow
+
+```
+main (production)
+  ↑
+  └── develop (staging)
+        ↑
+        ├── feature/user-authentication
+        ├── feature/product-management
+        └── bugfix/login-issue
+```
+
+**Branch Protection Rules:**
+
+- `main`: Requires PR approval, passing CI/CD, and code review
+- `develop`: Requires PR approval and passing tests
+- Feature branches: Created from `develop`, merged back via PR
+
+### 17.3 Code Review Checklist
+
+**Backend:**
+
+- [ ] Follows Clean Architecture principles
+- [ ] All commands/queries have validators
+- [ ] Unit tests cover business logic (>80% coverage)
+- [ ] Integration tests for API endpoints
+- [ ] Proper error handling and logging
+- [ ] Security best practices followed
+- [ ] Database migrations included
+- [ ] API documentation updated
+
+**Frontend:**
+
+- [ ] TypeScript types properly defined
+- [ ] Components follow single responsibility
+- [ ] Proper error boundaries implemented
+- [ ] Loading states handled
+- [ ] Accessibility (a11y) considered
+- [ ] Responsive design tested
+- [ ] Unit tests for utilities/hooks
+- [ ] E2E tests for critical flows
+
+---
+
+## 18. Troubleshooting Guide
+
+### 18.1 Common Issues
+
+**Database Connection Failures:**
+
+```bash
+# Check if PostgreSQL is running
+docker ps | grep postgres
+
+# Check connection from backend container
+docker exec -it app-backend sh
+psql -h postgres -U postgres -d appdb
+
+# Check logs
+docker logs app-postgres
+```
+
+**Redis Connection Issues:**
+
+```bash
+# Test Redis connection
+docker exec -it app-redis redis-cli ping
+
+# Check Redis logs
+docker logs app-redis
+
+# Monitor Redis commands
+docker exec -it app-redis redis-cli monitor
+```
+
+**Keycloak Issues:**
+
+```bash
+# Check Keycloak logs
+docker logs app-keycloak
+
+# Verify realm configuration
+curl http://localhost:8080/realms/my-realm/.well-known/openid-configuration
+```
+
+**Build Failures:**
+
+```bash
+# Clean Docker build cache
+docker builder prune -a
+
+# Rebuild with no cache
+docker-compose build --no-cache
+
+# Clean .NET build
+dotnet clean
+dotnet restore --force
+```
+
+### 18.2 Performance Issues
+
+**Slow Database Queries:**
+
+```sql
+-- Find slow queries
+SELECT
+    query,
+    calls,
+    total_time / 1000 AS total_seconds,
+    mean_time / 1000 AS mean_seconds
+FROM pg_stat_statements
+ORDER BY mean_time DESC
+LIMIT 10;
+
+-- Check missing indexes
+SELECT
+    schemaname,
+    tablename,
+    attname,
+    n_distinct,
+    correlation
+FROM pg_stats
+WHERE schemaname = 'public'
+ORDER BY n_distinct DESC;
+```
+
+**High Memory Usage:**
+
+```bash
+# Check container memory usage
+docker stats
+
+# Check .NET memory dump
+dotnet-dump collect -p <process-id>
+dotnet-dump analyze <dump-file>
+```
+
+---
+
+## 19. Ekler
+
+### 19.1 Kullanılan Paketler (Tamamı Açık Kaynak ve Ücretsiz)
+
+**Backend (.NET 9):**
+
+- ASP.NET Core (MIT License)
+- Entity Framework Core (MIT License)
+- Npgsql.EntityFrameworkCore.PostgreSQL (PostgreSQL License)
+- StackExchange.Redis (MIT License)
+- DispatchR (MIT License)
+- FluentValidation (Apache 2.0)
+- Serilog (Apache 2.0)
+- xUnit (Apache 2.0)
+- NSubstitute (BSD License)
+- FluentAssertions (Apache 2.0)
+- Testcontainers (MIT License)
+
+**Frontend (Next.js 15):**
+
+- Next.js (MIT License)
+- React (MIT License)
+- TypeScript (Apache 2.0)
+- Tailwind CSS (MIT License)
+- shadcn/ui (MIT License)
+- Axios (MIT License)
+- React Hook Form (MIT License)
+- Zod (MIT License)
+- TanStack Query (MIT License)
+- Playwright (Apache 2.0)
+
+**Infrastructure:**
+
+- PostgreSQL (PostgreSQL License - Açık Kaynak)
+- Redis (BSD License)
+- Keycloak (Apache 2.0)
+- Docker (Apache 2.0)
+- SonarQube Community Edition (LGPL)
+- Sentry (BSD License - Ücretsiz plan mevcut)
+
+### 19.2 Faydalı Kaynaklar
+
+**Dokümantasyon:**
+
+- [ASP.NET Core Documentation](https://docs.microsoft.com/aspnet/core)
+- [Next.js Documentation](https://nextjs.org/docs)
+- [Entity Framework Core](https://docs.microsoft.com/ef/core)
+- [PostgreSQL Documentation](https://www.postgresql.org/docs)
+- [Keycloak Documentation](https://www.keycloak.org/documentation)
+
+**Clean Architecture:**
+
+- Clean Architecture by Robert C. Martin
+- [Clean Architecture with ASP.NET Core](https://github.com/jasontaylordev/CleanArchitecture)
+- [CQRS Pattern](https://martinfowler.com/bliki/CQRS.html)
+
+**Security:**
+
+- [OWASP Top 10](https://owasp.org/www-project-top-ten/)
+- [OAuth 2.0 Security Best Practices](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics)
+- [JWT Best Practices](https://tools.ietf.org/html/rfc8725)
+
+---
+
+## 20. Sonuç ve Öneriler
+
+### 20.1 Proje Başlangıç Adımları
+
+1. **Hafta 1-2: Altyapı ve Temel Kurulum**
+
+   - Repository ve branch stratejisi oluşturma
+   - Docker Compose ortamı kurulumu
+   - CI/CD pipeline yapılandırması
+   - Keycloak realm ve client yapılandırması
+
+2. **Hafta 3-4: Backend Temel Mimari**
+
+   - Clean Architecture katmanlarının oluşturulması
+   - Domain entity'leri ve value object'leri
+   - Repository pattern implementasyonu
+   - İlk CQRS command/query implementasyonu
+
+3. **Hafta 5-6: Frontend Temel Yapı**
+
+   - Next.js 15 proje kurulumu
+   - shadcn/ui komponenlerinin entegrasyonu
+   - Authentication flow implementasyonu
+   - OpenAPI client generation
+
+4. **Hafta 7-8: Feature Development**
+
+   - Ürün yönetimi modülü
+   - Kategori yönetimi
+   - Kullanıcı yönetimi
+   - Arama ve filtreleme
+
+5. **Hafta 9-10: Test ve Kalite**
+
+   - Unit test coverage >80%
+   - Integration testler
+   - E2E testler
+   - SonarQube analizi
+
+6. **Hafta 11-12: Production Hazırlık**
+   - Performance optimization
+   - Security audit
+   - Kubernetes deployment
+   - Monitoring ve alerting
+
+### 20.2 Kritik Başarı Faktörleri
+
+✅ **Mimari Tutarlılık:** Clean Architecture ve SOLID prensiplerini tutarlı şekilde uygulayın
+✅ **Test Coverage:** Her katman için yeterli test coverage sağlayın
+✅ **Security First:** Güvenliği en baştan tasarımın merkezine koyun
+✅ **Documentation:** Kod ve API dokümantasyonunu güncel tutun
+✅ **Code Review:** Tüm değişiklikleri code review sürecinden geçirin
+✅ **Monitoring:** Production ortamını sürekli izleyin
+✅ **Automation:** CI/CD pipeline'ı ile tüm süreci otomatikleştirin
+
+### 20.3 Gelecek Geliştirmeler
+
+- [ ] GraphQL API opsiyonu
+- [ ] Real-time features (SignalR)
+- [ ] Advanced caching strategies (CDN, edge caching)
+- [ ] Multi-tenancy support
+- [ ] Advanced analytics ve reporting
+- [ ] Mobile app (React Native)
+- [ ] Machine learning integration
+- [ ] Advanced search (Elasticsearch)
+
+---
+
+**Doküman Sonu**
+
+Bu doküman, modern, güvenli ve ölçeklenebilir bir web uygulaması geliştirmek için gerekli tüm detayları içermektedir. Tüm teknolojiler ve paketler açık kaynak ve ücretsizdir, hiçbir ücretli bağımlılık bulunmamaktadır.
